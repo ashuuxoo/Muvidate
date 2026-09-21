@@ -1,0 +1,28 @@
+name: Feature request
+description: Suggest an improvement for MuviDate
+title: "[Feature]: "
+labels:
+  - enhancement
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Describe the problem you want to solve and the experience you would like to have.
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      placeholder: What limitation or user problem does this address?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      placeholder: Describe the feature or behavior you would like.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
