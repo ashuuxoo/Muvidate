@@ -1,7 +1,6 @@
 import { initializeApp, getApps, getApp } from "firebase/app";
 import { 
   getAuth, 
-  signInAnonymously, 
   onAuthStateChanged, 
   User,
   signInWithEmailAndPassword,
@@ -9,6 +8,7 @@ import {
   linkWithCredential,
   EmailAuthProvider,
   updatePassword,
+  signOut,
   setPersistence,
   browserLocalPersistence
 } from "firebase/auth";
@@ -19,6 +19,7 @@ import {
   setDoc, 
   updateDoc, 
   deleteDoc,
+  deleteField,
   collection, 
   query, 
   where, 
@@ -67,12 +68,12 @@ export const rtdb = getDatabase(app, firebaseConfig.databaseURL);
 
 // --- Auth & User Profile Functions ---
 
-export async function ensureAnonymousAuth(): Promise<User> {
-  if (auth.currentUser) {
-    return auth.currentUser;
-  }
-  const cred = await signInAnonymously(auth);
-  return cred.user;
+export function getCurrentAuthUser(): User | null {
+  return auth.currentUser;
+}
+
+export async function logoutUser(): Promise<void> {
+  await signOut(auth);
 }
 
 export async function getUserProfile(uid: string): Promise<UserProfile | null> {
@@ -96,12 +97,29 @@ export async function isUsernameTaken(username: string, excludeUid?: string): Pr
     where("usernameLowercase", "==", normalized)
   );
   const snap = await getDocs(q);
-  if (snap.empty) return false;
-  if (excludeUid) {
-    const isOnlyMe = snap.docs.every(d => d.id === excludeUid);
-    return !isOnlyMe;
+  if (!snap.empty) {
+    if (excludeUid) {
+      const isOnlyMe = snap.docs.every(d => d.id === excludeUid);
+      return !isOnlyMe;
+    }
+    return true;
   }
-  return true;
+
+  // Also verify against legacy records where username was stored without usernameLowercase
+  const legacyQuery = query(
+    collection(firestore, "users"),
+    where("username", "==", username.trim())
+  );
+  const legacySnap = await getDocs(legacyQuery);
+  if (!legacySnap.empty) {
+    if (excludeUid) {
+      const isOnlyMe = legacySnap.docs.every(d => d.id === excludeUid);
+      return !isOnlyMe;
+    }
+    return true;
+  }
+
+  return false;
 }
 
 // Helper to convert username to internal Firebase Auth email format
@@ -169,38 +187,33 @@ export async function registerWithUsernameAndPassword(
     throw new Error(`Username "${trimmed}" is already taken. Please choose another.`);
   }
 
-  let finalUid = auth.currentUser?.uid;
+  if (!password || password.length < 6) {
+    throw new Error("Password must be at least 6 characters long.");
+  }
+  const email = usernameToAuthEmail(trimmed);
 
-  if (password && password.length > 0) {
-    if (password.length < 6) {
-      throw new Error("Password must be at least 6 characters long.");
-    }
-    const email = usernameToAuthEmail(trimmed);
+  let finalUid: string;
 
-    if (auth.currentUser && auth.currentUser.isAnonymous) {
-      try {
-        const cred = await linkWithCredential(
-          auth.currentUser, 
-          EmailAuthProvider.credential(email, password)
-        );
-        finalUid = cred.user.uid;
-      } catch (linkErr: any) {
-        if (linkErr.code === "auth/credential-already-in-use" || linkErr.code === "auth/email-already-in-use") {
-          throw new Error(`An account with username "${trimmed}" already exists.`);
-        }
-        // Fallback: create fresh credential
-        const cred = await createUserWithEmailAndPassword(auth, email, password);
-        finalUid = cred.user.uid;
+  if (auth.currentUser && auth.currentUser.isAnonymous) {
+    try {
+      const cred = await linkWithCredential(
+        auth.currentUser, 
+        EmailAuthProvider.credential(email, password)
+      );
+      finalUid = cred.user.uid;
+    } catch (linkErr: any) {
+      if (linkErr.code === "auth/credential-already-in-use" || linkErr.code === "auth/email-already-in-use") {
+        throw new Error(`An account with username "${trimmed}" already exists.`);
       }
-    } else if (!auth.currentUser) {
+      // Fallback: create fresh email/password credential
       const cred = await createUserWithEmailAndPassword(auth, email, password);
       finalUid = cred.user.uid;
     }
-  }
-
-  if (!finalUid) {
-    const anon = await ensureAnonymousAuth();
-    finalUid = anon.uid;
+  } else if (!auth.currentUser) {
+    const cred = await createUserWithEmailAndPassword(auth, email, password);
+    finalUid = cred.user.uid;
+  } else {
+    finalUid = auth.currentUser.uid;
   }
 
   const profileData: UserProfile = {
@@ -351,7 +364,134 @@ export async function getDailyRoomCount(uid: string): Promise<number> {
   return snap.exists() ? (snap.val().count || 0) : 0;
 }
 
-// --- 4-Digit Room Code Generator ---
+// Track in-flight daily room limits cleanup to prevent duplicate executions
+let dailyLimitsCleanupRan = false;
+
+/**
+ * Scan the dailyRoomLimits node in Firebase RTDB on startup.
+ * Deletes any historical entries whose date is NOT today's date (using getTodayDateKey()).
+ */
+export async function cleanupExpiredDailyRoomLimits(): Promise<void> {
+  if (dailyLimitsCleanupRan) return;
+  dailyLimitsCleanupRan = true;
+
+  try {
+    const today = getTodayDateKey();
+    const dailyLimitsRef = ref(rtdb, "dailyRoomLimits");
+    const snap = await get(dailyLimitsRef);
+
+    if (!snap.exists()) return;
+    const data = snap.val();
+    if (!data || typeof data !== "object") return;
+
+    const deletionPromises: Promise<void>[] = [];
+
+    for (const [key, value] of Object.entries(data)) {
+      if (!key) continue;
+
+      // Case 1: Direct date entry under dailyRoomLimits (e.g. dailyRoomLimits/{date})
+      if (key !== today && (key.match(/^\d{4}-\d{2}-\d{2}/) || (value && typeof value === "object" && ("count" in value || "lastCreated" in value)))) {
+        deletionPromises.push(remove(ref(rtdb, `dailyRoomLimits/${key}`)).catch(() => {}));
+      } 
+      // Case 2: Nested under user UID (e.g. dailyRoomLimits/{uid}/{date})
+      else if (value && typeof value === "object") {
+        for (const [subKey] of Object.entries(value)) {
+          if (subKey && subKey !== today) {
+            deletionPromises.push(remove(ref(rtdb, `dailyRoomLimits/${key}/${subKey}`)).catch(() => {}));
+          }
+        }
+      }
+    }
+
+    if (deletionPromises.length > 0) {
+      await Promise.allSettled(deletionPromises);
+    }
+  } catch (err) {
+    console.warn("cleanupExpiredDailyRoomLimits error:", err);
+  }
+}
+
+// --- 4-Digit Room Code Generator & Expired Room Cleanup ---
+
+// Set to track in-flight room deletions to prevent concurrent duplicate delete operations
+const pendingRoomDeletions = new Set<string>();
+
+/**
+ * Safely delete a single room from RTDB if and only if its stored expiresAt is past the current timestamp.
+ * If expectedExpiresAt is provided, it verifies that the room's current expiresAt matches (ensuring no race condition
+ * with a freshly created room under the same code).
+ */
+export async function deleteExpiredRoomIfExpired(
+  roomCode: string, 
+  expectedExpiresAt?: number
+): Promise<boolean> {
+  if (!roomCode || pendingRoomDeletions.has(roomCode)) return false;
+  pendingRoomDeletions.add(roomCode);
+
+  try {
+    const roomRef = ref(rtdb, `rooms/${roomCode}`);
+    const snap = await get(roomRef);
+    if (!snap.exists()) {
+      return false;
+    }
+    const data = snap.val();
+    const now = Date.now();
+    if (data && typeof data.expiresAt === "number" && now > data.expiresAt) {
+      if (!expectedExpiresAt || data.expiresAt === expectedExpiresAt) {
+        await remove(roomRef);
+        return true;
+      }
+    }
+    return false;
+  } catch (err) {
+    console.warn(`Error deleting expired room #${roomCode}:`, err);
+    return false;
+  } finally {
+    pendingRoomDeletions.delete(roomCode);
+  }
+}
+
+/**
+ * Scan a map of rooms and delete all rooms that have reached their 24h expiration timestamp.
+ */
+export async function cleanupExpiredRoomsFromData(roomsData: Record<string, any>): Promise<void> {
+  if (!roomsData || typeof roomsData !== "object") return;
+  const now = Date.now();
+
+  const expiredEntries = Object.entries(roomsData).filter(([code, r]) => {
+    return (
+      code &&
+      r &&
+      typeof r.expiresAt === "number" &&
+      now > r.expiresAt &&
+      !pendingRoomDeletions.has(code)
+    );
+  });
+
+  if (expiredEntries.length === 0) return;
+
+  await Promise.allSettled(
+    expiredEntries.map(([code, r]) => deleteExpiredRoomIfExpired(code, r.expiresAt))
+  );
+}
+
+/**
+ * Check all rooms in RTDB and perform an immediate cleanup pass of expired rooms.
+ */
+export async function checkAndCleanupExpiredRooms(): Promise<void> {
+  try {
+    const roomsRef = ref(rtdb, "rooms");
+    const snap = await get(roomsRef);
+    if (snap.exists()) {
+      const data = snap.val();
+      if (data && typeof data === "object") {
+        await cleanupExpiredRoomsFromData(data);
+      }
+    }
+  } catch (err) {
+    console.warn("checkAndCleanupExpiredRooms error:", err);
+  }
+}
 
 export async function generateUniqueRoomCode(): Promise<string> {
   let attempts = 0;
@@ -389,7 +529,8 @@ export function subscribeToMovies(callback: (movies: Movie[]) => void, onError?:
     const list: Movie[] = [];
     snap.forEach((doc) => {
       const data = doc.data();
-      list.push({
+      const movieObj: any = {
+        ...data,
         id: doc.id,
         Title: data.Title || data.title || "Untitled Movie",
         title: data.Title || data.title || "Untitled Movie",
@@ -398,9 +539,12 @@ export function subscribeToMovies(callback: (movies: Movie[]) => void, onError?:
         description: data.description || "",
         poster: data.poster || "",
         cover: data.cover || undefined,
+        subtitle: data.subtitle || undefined,
+        trailer: data.trailer || undefined,
         url: data.url || "",
         createdAt: data.createdAt
-      });
+      };
+      list.push(movieObj);
     });
     callback(list);
   }, (err) => {
@@ -416,21 +560,174 @@ export async function addMovieToFirestore(movieData: {
   description: string;
   poster: string;
   cover?: string;
+  subtitle?: string;
+  trailer?: string;
   url: string;
+  seasonNumber?: number;
+  [key: string]: any;
 }): Promise<string> {
   const collRef = collection(firestore, "movie");
   const payload: any = {
     Title: movieData.Title.trim(),
     genre: movieData.genre.trim(),
-    year: Number(movieData.year),
+    year: Number(movieData.year) || new Date().getFullYear(),
     description: movieData.description.trim(),
     poster: movieData.poster.trim(),
-    url: movieData.url.trim(),
     createdAt: serverTimestamp()
   };
+
+  const seasonNum =
+    movieData.seasonNumber && movieData.seasonNumber > 0
+      ? Math.floor(movieData.seasonNumber)
+      : 1;
+  const rawUrl = (movieData.url || "").trim();
+
+  if (seasonNum === 1) {
+    payload.url = rawUrl;
+  } else {
+    payload[`url${seasonNum}`] = rawUrl;
+    // Keep standard url field present as provided default or empty
+    if (movieData.defaultUrl && typeof movieData.defaultUrl === "string") {
+      payload.url = movieData.defaultUrl.trim();
+    }
+  }
+
+  // Also include any explicit url2, url3 passed in movieData if present and non-empty
+  for (const key of Object.keys(movieData)) {
+    if (/^url\d+$/i.test(key) && key.toLowerCase() !== "url1") {
+      const val = movieData[key];
+      if (typeof val === "string" && val.trim() !== "") {
+        payload[key] = val.trim();
+      }
+    }
+  }
+
   if (movieData.cover && movieData.cover.trim() !== "") {
     payload.cover = movieData.cover.trim();
   }
+
+  if (movieData.subtitle && movieData.subtitle.trim() !== "") {
+    payload.subtitle = movieData.subtitle.trim();
+  }
+
+  if (movieData.trailer && movieData.trailer.trim() !== "") {
+    payload.trailer = movieData.trailer.trim();
+  }
+
+  // Prevent sending undefined or empty optional fields
+  for (const k of Object.keys(payload)) {
+    if (payload[k] === undefined) {
+      delete payload[k];
+    }
+  }
+
   const docRef = await addDoc(collRef, payload);
   return docRef.id;
+}
+
+export async function updateMovieInFirestore(
+  movieId: string,
+  movieData: {
+    Title?: string;
+    genre?: string;
+    year?: number;
+    description?: string;
+    poster?: string;
+    cover?: string | null;
+    subtitle?: string | null;
+    trailer?: string | null;
+    url?: string;
+    seasonNumber?: number;
+    [key: string]: any;
+  }
+): Promise<void> {
+  if (!movieId) throw new Error("Movie ID is required for update.");
+  const docRef = doc(firestore, "movie", movieId);
+  const payload: any = {
+    updatedAt: serverTimestamp()
+  };
+
+  if (movieData.Title !== undefined) {
+    payload.Title = movieData.Title.trim();
+  }
+  if (movieData.genre !== undefined) {
+    payload.genre = movieData.genre.trim();
+  }
+  if (movieData.year !== undefined) {
+    const y = Number(movieData.year);
+    if (!isNaN(y) && y > 0) {
+      payload.year = y;
+    }
+  }
+  if (movieData.description !== undefined) {
+    payload.description = movieData.description.trim();
+  }
+  if (movieData.poster !== undefined && movieData.poster.trim() !== "") {
+    payload.poster = movieData.poster.trim();
+  }
+
+  // Cover URL
+  if (movieData.cover !== undefined) {
+    if (movieData.cover && movieData.cover.trim() !== "") {
+      payload.cover = movieData.cover.trim();
+    } else {
+      payload.cover = deleteField();
+    }
+  }
+
+  // Subtitle URL(s)
+  if (movieData.subtitle !== undefined) {
+    if (movieData.subtitle && movieData.subtitle.trim() !== "") {
+      payload.subtitle = movieData.subtitle.trim();
+    } else {
+      payload.subtitle = deleteField();
+    }
+  }
+
+  // Trailer URL
+  if (movieData.trailer !== undefined) {
+    if (movieData.trailer && movieData.trailer.trim() !== "") {
+      payload.trailer = movieData.trailer.trim();
+    } else {
+      payload.trailer = deleteField();
+    }
+  }
+
+  // Media URLs & Seasons
+  if (movieData.url !== undefined) {
+    const rawUrl = movieData.url.trim();
+    const seasonNum =
+      movieData.seasonNumber && movieData.seasonNumber > 0
+        ? Math.floor(movieData.seasonNumber)
+        : 1;
+
+    if (seasonNum === 1) {
+      payload.url = rawUrl;
+    } else {
+      payload[`url${seasonNum}`] = rawUrl;
+    }
+  }
+
+  // Extra season URLs (url2, url3, etc.)
+  for (const key of Object.keys(movieData)) {
+    if (/^url\d+$/i.test(key) && key.toLowerCase() !== "url1") {
+      const val = movieData[key];
+      if (typeof val === "string") {
+        if (val.trim() !== "") {
+          payload[key] = val.trim();
+        } else {
+          payload[key] = deleteField();
+        }
+      }
+    }
+  }
+
+  // Sanitize: ensure no undefined fields
+  for (const k of Object.keys(payload)) {
+    if (payload[k] === undefined) {
+      delete payload[k];
+    }
+  }
+
+  await updateDoc(docRef, payload);
 }

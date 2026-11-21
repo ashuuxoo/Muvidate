@@ -8,8 +8,7 @@ import {
   Upload, 
   User, 
   X, 
-  Menu,
-  Smartphone
+  Menu
 } from "lucide-react";
 
 interface NavbarProps {
@@ -73,18 +72,6 @@ export function Navbar({
 
         {/* Right Desktop Actions */}
         <div className="hidden sm:flex items-center gap-2.5">
-          {/* Download Android App Button */}
-          <a
-            href="https://github.com/jinwoo-09/muvidate/releases/download/1.0/Muvidate_1.0.apk"
-            download
-            className="px-3 py-2 bg-gradient-to-r from-emerald-950/40 to-neutral-900 hover:from-emerald-900/50 hover:to-neutral-850 border border-emerald-500/30 text-emerald-400 hover:text-emerald-300 rounded-xl text-xs font-semibold transition flex items-center gap-1.5 shadow-sm group"
-            title="Download MuviDate Android App (APK)"
-          >
-            <Smartphone className="w-3.5 h-3.5 text-emerald-400 group-hover:scale-110 transition-transform" />
-            <span className="hidden lg:inline">Android App</span>
-            <span className="lg:hidden">App</span>
-          </a>
-
           <button
             onClick={onJoinRoomClick}
             className="px-3.5 py-2 bg-neutral-900 hover:bg-neutral-850 border border-neutral-750 text-neutral-200 hover:text-white rounded-xl text-xs font-semibold transition flex items-center gap-1.5 shadow-sm"
@@ -105,7 +92,7 @@ export function Navbar({
             <button
               onClick={onUploadMovieClick}
               className="p-2 bg-neutral-900 hover:bg-neutral-800 border border-neutral-750 text-neutral-300 hover:text-white rounded-xl transition"
-              title="Upload Movie to Firestore"
+              title="Add Movie to Firestore"
             >
               <Upload className="w-4 h-4" />
             </button>
@@ -202,15 +189,6 @@ export function Navbar({
           </div>
 
           <div className="pt-2 border-t border-neutral-900 space-y-2">
-            <a
-              href="https://github.com/jinwoo-09/muvidate/releases/download/1.0/Muvidate_1.0.apk"
-              download
-              className="w-full py-2.5 px-3 bg-gradient-to-r from-emerald-950/60 to-neutral-900 hover:from-emerald-900/70 hover:to-neutral-850 border border-emerald-500/40 text-emerald-300 hover:text-white rounded-xl text-xs font-semibold flex items-center justify-center gap-2 shadow transition"
-            >
-              <Smartphone className="w-4 h-4 text-emerald-400" />
-              <span>Download Android App (.apk)</span>
-            </a>
-
             <div className="flex items-center justify-between pt-1">
               {profile?.subscription === "premium" ? (
                 <>
@@ -222,7 +200,7 @@ export function Navbar({
                     className="text-xs text-neutral-400 hover:text-white flex items-center gap-2 py-1.5"
                   >
                     <Upload className="w-4 h-4 text-neutral-500" />
-                    <span>Upload Movie (MP4)</span>
+                    <span>Add Movie</span>
                   </button>
 
                   <button

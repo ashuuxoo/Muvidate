@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useMemo } from "react";
 import { AuthProvider, useAuth } from "./context/AuthContext";
-import { subscribeToMovies, rtdb } from "./lib/firebase";
+import { subscribeToMovies, rtdb, cleanupExpiredRoomsFromData, checkAndCleanupExpiredRooms, cleanupExpiredDailyRoomLimits } from "./lib/firebase";
 import { ref, onValue, off } from "firebase/database";
 import { Movie } from "./types";
 import { Navbar } from "./components/Navbar";
@@ -23,8 +23,6 @@ import {
   SlidersHorizontal,
   Flame,
   Instagram,
-  Smartphone,
-  Download,
   Loader2
 } from "lucide-react";
 
@@ -38,6 +36,12 @@ function MainContent() {
   const [selectedGenre, setSelectedGenre] = useState("All");
 
   const [activeUserRooms, setActiveUserRooms] = useState<any[]>([]);
+
+  // Cleanup expired rooms and outdated daily room limits from RTDB on site load
+  useEffect(() => {
+    checkAndCleanupExpiredRooms();
+    cleanupExpiredDailyRoomLimits();
+  }, []);
 
   // Subscribe to user's active watch rooms
   useEffect(() => {
@@ -53,6 +57,9 @@ function MainContent() {
         setActiveUserRooms([]);
         return;
       }
+
+      // Cleanup any expired rooms found in RTDB
+      cleanupExpiredRoomsFromData(data).catch(() => {});
 
       const now = Date.now();
       const roomsList = Object.entries(data).map(([code, r]: [string, any]) => ({
@@ -93,14 +100,50 @@ function MainContent() {
   const [isProfileOpen, setIsProfileOpen] = useState(false);
   const [selectedMovieForDetail, setSelectedMovieForDetail] = useState<Movie | null>(null);
   const [preselectedMovieForRoom, setPreselectedMovieForRoom] = useState<Movie | null>(null);
+  const [movieToEdit, setMovieToEdit] = useState<Movie | null>(null);
 
-  // Parse room code from URL if present (e.g. ?room=1234 or #1234)
-  useEffect(() => {
-    const params = new URLSearchParams(window.location.search);
-    const roomFromQuery = params.get("room");
-    if (roomFromQuery && /^\d{4}$/.test(roomFromQuery)) {
-      setActiveRoomCode(roomFromQuery);
+  // Helper to extract room code from URL (supporting query params and hash for direct links)
+  const extractRoomCodeFromUrl = () => {
+    try {
+      const params = new URLSearchParams(window.location.search);
+      let room = params.get("room");
+      if (!room && window.location.hash) {
+        const hash = window.location.hash.replace(/^#\/?/, "");
+        if (/^\d{4}$/.test(hash)) {
+          room = hash;
+        } else {
+          const hashQuery = hash.includes("?") ? hash.split("?")[1] : hash;
+          const hashParams = new URLSearchParams(hashQuery);
+          const hashRoom = hashParams.get("room");
+          if (hashRoom && /^\d{4}$/.test(hashRoom)) {
+            room = hashRoom;
+          }
+        }
+      }
+      return room && /^\d{4}$/.test(room) ? room : null;
+    } catch {
+      return null;
     }
+  };
+
+  // Parse room code from URL if present (e.g. ?room=1234 or #1234) and handle device back navigation
+  useEffect(() => {
+    const initialRoom = extractRoomCodeFromUrl();
+    if (initialRoom) {
+      setActiveRoomCode(initialRoom);
+    }
+
+    const handleUrlChange = () => {
+      const room = extractRoomCodeFromUrl();
+      setActiveRoomCode(room);
+    };
+
+    window.addEventListener("popstate", handleUrlChange);
+    window.addEventListener("hashchange", handleUrlChange);
+    return () => {
+      window.removeEventListener("popstate", handleUrlChange);
+      window.removeEventListener("hashchange", handleUrlChange);
+    };
   }, []);
 
   // Listen to Firestore movie collection
@@ -161,7 +204,7 @@ function MainContent() {
     });
   }, [movies, selectedGenre, searchQuery]);
 
-  // Auto-rotating hero index every 3 seconds among movies
+  // Auto-rotating hero index every 10 seconds among movies
   const [heroIndex, setHeroIndex] = useState(0);
 
   // Available movies for hero banner (prioritizing movies that have a poster)
@@ -174,7 +217,7 @@ function MainContent() {
     if (heroCandidates.length <= 1) return;
     const interval = setInterval(() => {
       setHeroIndex((prev) => (prev + 1) % heroCandidates.length);
-    }, 3000);
+    }, 10000);
     return () => clearInterval(interval);
   }, [heroCandidates.length]);
 
@@ -210,7 +253,7 @@ function MainContent() {
   // If user is inside an active watch room, show the WatchRoom view
   if (activeRoomCode) {
     return (
-      <div className="min-h-screen bg-neutral-950 text-neutral-100 flex flex-col selection:bg-rose-500 selection:text-white">
+      <div className="min-h-screen bg-neutral-950 text-neutral-100 flex flex-col selection:bg-rose-500 selection:text-white app-root-container">
         <UsernameSetupModal />
         <ProfileModal
           isOpen={isProfileOpen}
@@ -226,7 +269,7 @@ function MainContent() {
   }
 
   return (
-    <div className="min-h-screen bg-neutral-950 text-neutral-100 flex flex-col selection:bg-rose-500 selection:text-white">
+    <div className="min-h-screen bg-neutral-950 text-neutral-100 flex flex-col selection:bg-rose-500 selection:text-white app-root-container">
       {/* Mandatory Onboarding Username Modal */}
       <UsernameSetupModal />
 
@@ -239,7 +282,11 @@ function MainContent() {
       {/* Upload Movie Modal */}
       <UploadMovieModal
         isOpen={isUploadMovieOpen}
-        onClose={() => setIsUploadMovieOpen(false)}
+        onClose={() => {
+          setIsUploadMovieOpen(false);
+          setMovieToEdit(null);
+        }}
+        movieToEdit={movieToEdit}
       />
 
       {/* Create Room Modal */}
@@ -266,6 +313,10 @@ function MainContent() {
         movie={selectedMovieForDetail}
         onClose={() => setSelectedMovieForDetail(null)}
         onCreateRoom={(m) => handleStartCreateRoom(m)}
+        onEditMovie={(m) => {
+          setMovieToEdit(m);
+          setIsUploadMovieOpen(true);
+        }}
       />
 
       {/* Top Navbar */}
@@ -274,7 +325,10 @@ function MainContent() {
         onSearchChange={setSearchQuery}
         onCreateRoomClick={() => handleStartCreateRoom()}
         onJoinRoomClick={() => setIsJoinRoomOpen(true)}
-        onUploadMovieClick={() => setIsUploadMovieOpen(true)}
+        onUploadMovieClick={() => {
+          setMovieToEdit(null);
+          setIsUploadMovieOpen(true);
+        }}
         onProfileClick={() => setIsProfileOpen(true)}
       />
 
@@ -301,7 +355,7 @@ function MainContent() {
             <div>
               <h3 className="text-sm font-bold text-white">Have a 4-Digit Room Code?</h3>
               <p className="text-xs text-neutral-400">
-                Join friends instantly with synchronized playback, live chat & voice notes.
+                Join friends instantly with synchronized playback and live chat.
               </p>
             </div>
           </div>
@@ -445,7 +499,7 @@ function MainContent() {
                 {searchQuery
                   ? `No titles matched "${searchQuery}". Try searching for another genre or keyword.`
                   : isPremium
-                    ? "Upload the first MP4 movie to MuviDate or stream via direct URL."
+                    ? "Add the first movie or series URL to MuviDate."
                     : "Create a Watch Room with an offline video or direct URL to start watching together!"}
               </p>
               {searchQuery ? (
@@ -464,7 +518,7 @@ function MainContent() {
                   className="px-5 py-2.5 bg-rose-600 hover:bg-rose-500 text-white text-xs font-semibold rounded-xl shadow transition flex items-center gap-1.5"
                 >
                   <PlusCircle className="w-4 h-4" />
-                  <span>Upload Movie Now</span>
+                  <span>Add Movie Now</span>
                 </button>
               ) : (
                 <button
@@ -496,23 +550,6 @@ function MainContent() {
             >
               <Instagram className="w-3.5 h-3.5 text-rose-500 group-hover:scale-110 transition-transform" />
               <span>Developer: <strong className="text-white font-medium group-hover:text-rose-400">Ashuuxoo</strong></span>
-            </a>
-          </div>
-
-          {/* Android App Download Action */}
-          <div className="flex items-center gap-3">
-            <a
-              href="https://github.com/jinwoo-09/muvidate/releases/download/1.0/Muvidate_1.0.apk"
-              download
-              className="inline-flex items-center gap-2 px-3.5 py-1.5 rounded-full bg-gradient-to-r from-emerald-950/60 via-neutral-900 to-rose-950/30 hover:from-emerald-900/80 hover:to-neutral-800 text-neutral-200 hover:text-white border border-emerald-500/40 hover:border-emerald-400 transition shadow-sm font-medium group"
-              title="Download MuviDate APK for Android"
-            >
-              <Smartphone className="w-3.5 h-3.5 text-emerald-400 group-hover:scale-110 transition-transform" />
-              <span>Download Android App</span>
-              <span className="text-[10px] uppercase font-mono px-1.5 py-0.2 rounded bg-emerald-900/60 text-emerald-300 font-semibold border border-emerald-700/50 flex items-center gap-0.5">
-                <Download className="w-2.5 h-2.5" />
-                APK
-              </span>
             </a>
           </div>
         </div>

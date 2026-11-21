@@ -1,12 +1,13 @@
 import React, { useState, useEffect, useRef, useCallback, useMemo } from "react";
 import { useAuth } from "../context/AuthContext";
-import { rtdb } from "../lib/firebase";
+import { rtdb, deleteExpiredRoomIfExpired } from "../lib/firebase";
 import { ref, onValue, off, update, set, push, onDisconnect } from "firebase/database";
 import { Room, RoomParticipant } from "../types";
 import { getVideoDuration, formatVideoTime } from "../lib/videoUtils";
 import { VideoPlayer } from "./VideoPlayer";
 import { RoomChat } from "./RoomChat";
 import { ChangeMediaModal } from "./ChangeMediaModal";
+import { SeriesStructure, extractSeriesStructure, getEpisodeUrl } from "../lib/seriesUtils";
 import { 
   Copy, 
   Check, 
@@ -23,8 +24,7 @@ import {
   Clock, 
   ArrowLeft,
   RefreshCw,
-  Loader2,
-  Smartphone 
+  Loader2
 } from "lucide-react";
 
 interface WatchRoomProps {
@@ -64,22 +64,49 @@ export function WatchRoom({ roomCode, initialOfflineFile, onLeaveRoom }: WatchRo
   const [activeTab, setActiveTab] = useState<"chat" | "participants">("chat");
   const [showParticipantsMobile, setShowParticipantsMobile] = useState(false);
   const [isChangeMediaOpen, setIsChangeMediaOpen] = useState(false);
-  const [isVoiceRecording, setIsVoiceRecording] = useState(false);
 
   // Throttled sync updates
   const lastSyncWriteTime = useRef<number>(0);
 
+  // Determine series structure for current room media
+  const roomSeriesStructure = useMemo<SeriesStructure | undefined>(() => {
+    if (!room || room.movieSource === "offline") return undefined;
+    const structure = extractSeriesStructure(room.seriesUrls || room.movieUrl || "");
+    return structure.isSeries ? structure : undefined;
+  }, [room?.movieSource, room?.seriesUrls, room?.movieUrl]);
+
   // Determine video playback source with memoization at top level (unconditional hook execution)
   const effectiveVideoSrc = useMemo(() => {
     if (!room) return "";
-    return room.movieSource === "offline" ? (localVideoUrl || "") : (room.movieUrl || "");
-  }, [room?.movieSource, room?.movieUrl, localVideoUrl]);
+    if (room.movieSource === "offline") {
+      return localVideoUrl || "";
+    }
+    // If room has currentEpisodeUrl, use it; otherwise fallback to movieUrl
+    if (room.currentEpisodeUrl && room.currentEpisodeUrl.trim()) {
+      return room.currentEpisodeUrl;
+    }
+    // If room is detected as series, default to current season and episode
+    if (roomSeriesStructure && roomSeriesStructure.isSeries) {
+      const epUrl = getEpisodeUrl(roomSeriesStructure, room.season || 1, room.episode || 1);
+      if (epUrl) return epUrl;
+    }
+    return room.movieUrl || "";
+  }, [room?.movieSource, room?.movieUrl, room?.currentEpisodeUrl, room?.season, room?.episode, roomSeriesStructure, localVideoUrl]);
+
+  // Determine effective subtitle for current season (supports subtitle, subtitle2, subtitle3, etc.)
+  const effectiveSubtitle = useMemo(() => {
+    if (!room || room.movieSource === "offline") return undefined;
+    const currentSeason = room.season || 1;
+    const seasonSubtitleKey = currentSeason === 1 ? "subtitle" : `subtitle${currentSeason}`;
+    return (room as any)[seasonSubtitleKey] || room.subtitle;
+  }, [room?.movieSource, room?.season, room?.subtitle, (room as any)?.subtitle2, (room as any)?.subtitle3]);
 
   const handleOfflineFileSelected = useCallback((file: File) => {
     if (activeObjectUrlRef.current && activeObjectUrlRef.current.startsWith("blob:")) {
       URL.revokeObjectURL(activeObjectUrlRef.current);
     }
     const url = URL.createObjectURL(file);
+    activeObjectUrlRef.current = url;
     setLocalVideoUrl(url);
     setLocalFileName(file.name);
     setOfflineDurationError(null);
@@ -92,6 +119,7 @@ export function WatchRoom({ roomCode, initialOfflineFile, onLeaveRoom }: WatchRo
         URL.revokeObjectURL(activeObjectUrlRef.current);
       }
       const url = URL.createObjectURL(initialOfflineFile);
+      activeObjectUrlRef.current = url;
       setLocalVideoUrl(url);
       setLocalFileName(initialOfflineFile.name);
     }
@@ -100,8 +128,18 @@ export function WatchRoom({ roomCode, initialOfflineFile, onLeaveRoom }: WatchRo
   const isHost = user?.uid === room?.adminUid;
   const lastProcessedMediaKeyRef = useRef<string>("");
 
+  const controlsLockedRef = useRef(room?.controlsLocked);
+  controlsLockedRef.current = room?.controlsLocked;
+
   const hasPostedJoinRef = useRef(false);
+  const isInitialSnapshotRef = useRef(false);
   const prevParticipantsRef = useRef<Record<string, boolean>>({});
+  const lastPresenceMessageTimestampRef = useRef<Record<string, { status: boolean; time: number; lastActive?: number }>>({});
+  const latestPlaybackStateRef = useRef<{
+    isPlaying: boolean;
+    currentTime: number;
+    lastUpdated: number;
+  } | null>(null);
 
   const postSystemMessage = useCallback((text: string) => {
     const chatRef = ref(rtdb, `rooms/${roomCode}/chat`);
@@ -115,6 +153,40 @@ export function WatchRoom({ roomCode, initialOfflineFile, onLeaveRoom }: WatchRo
       createdAt: Date.now()
     }).catch(console.error);
   }, [roomCode]);
+
+  // Handle user explicitly leaving the room (click Leave Room, Back to Home, etc.)
+  const handleExplicitLeaveRoom = useCallback(() => {
+    if (user && profile && roomCode) {
+      // Save latest valid video playback timeline
+      if (latestPlaybackStateRef.current && (isHost || !controlsLockedRef.current)) {
+        const lastPlayback = latestPlaybackStateRef.current;
+        if (lastPlayback.currentTime > 0) {
+          const playbackRef = ref(rtdb, `rooms/${roomCode}/playbackState`);
+          update(playbackRef, {
+            isPlaying: lastPlayback.isPlaying,
+            currentTime: lastPlayback.currentTime,
+            lastUpdated: Date.now(),
+            updatedBy: user.uid,
+            updatedByUsername: profile.username
+          }).catch(() => {});
+        }
+      }
+
+      // Mark participant as offline and cancel onDisconnect
+      const now = Date.now();
+      const participantRef = ref(rtdb, `rooms/${roomCode}/participants/${user.uid}`);
+      onDisconnect(participantRef).cancel().catch(() => {});
+      update(participantRef, {
+        isOnline: false,
+        lastActive: now,
+        lastLeaveMsgTime: now
+      }).catch(() => {});
+
+      // Post system leave message
+      postSystemMessage(`@${profile.username} has left the room.`);
+    }
+    onLeaveRoom();
+  }, [user, profile, roomCode, isHost, postSystemMessage, onLeaveRoom]);
 
   useEffect(() => {
     if (!room) return;
@@ -160,6 +232,7 @@ export function WatchRoom({ roomCode, initialOfflineFile, onLeaveRoom }: WatchRo
 
       // Check 24 hour expiration
       if (data.expiresAt && Date.now() > data.expiresAt) {
+        deleteExpiredRoomIfExpired(roomCode, data.expiresAt).catch(() => {});
         setError(`Room #${roomCode} has expired (24-hour limit reached).`);
         return;
       }
@@ -185,7 +258,14 @@ export function WatchRoom({ roomCode, initialOfflineFile, onLeaveRoom }: WatchRo
           prev.offlineFileName === data.offlineFileName &&
           prev.movieCompleted === data.movieCompleted &&
           prev.controlsLocked === data.controlsLocked &&
-          prev.expiresAt === data.expiresAt;
+          prev.expiresAt === data.expiresAt &&
+          prev.season === data.season &&
+          prev.episode === data.episode &&
+          prev.currentEpisodeUrl === data.currentEpisodeUrl &&
+          prev.subtitle === data.subtitle &&
+          (prev as any).subtitle2 === (data as any).subtitle2 &&
+          (prev as any).subtitle3 === (data as any).subtitle3 &&
+          prev.seriesUrls === data.seriesUrls;
 
         // Compare participants active count
         const prevParticipants = prev.participants || {};
@@ -215,27 +295,77 @@ export function WatchRoom({ roomCode, initialOfflineFile, onLeaveRoom }: WatchRo
 
     onValue(roomRef, handleRoomData);
 
-    // Update participant online status with onDisconnect support
-    if (user && profile) {
-      const participantRef = ref(rtdb, `rooms/${roomCode}/participants/${user.uid}`);
-      update(participantRef, {
-        isOnline: true,
-        joinedAt: Date.now(),
-        username: profile.username,
-        photoURL: profile.photoURL || ""
-      });
-      // Setup onDisconnect
-      onDisconnect(participantRef).update({ isOnline: false }).catch(() => {});
-    }
-
     return () => {
       off(roomRef, "value", handleRoomData);
-      if (user) {
-        const participantRef = ref(rtdb, `rooms/${roomCode}/participants/${user.uid}`);
-        update(participantRef, { isOnline: false }).catch(() => {});
+    };
+  }, [roomCode]);
+
+  // Robust Network Restore & User Presence Management with Firebase RTDB .info/connected
+  useEffect(() => {
+    if (!roomCode || !user || !profile) return;
+
+    const connectedRef = ref(rtdb, ".info/connected");
+    const participantRef = ref(rtdb, `rooms/${roomCode}/participants/${user.uid}`);
+
+    // Mark online immediately upon component mount/join
+    update(participantRef, {
+      isOnline: true,
+      username: profile.username,
+      photoURL: profile.photoURL || "",
+      lastActive: Date.now()
+    }).catch(() => {});
+
+    // Register onDisconnect handler
+    onDisconnect(participantRef).update({
+      isOnline: false,
+      lastActive: Date.now()
+    }).catch(() => {});
+
+    const handleConnectionChange = (snap: any) => {
+      const isConnected = snap.val() === true;
+      if (isConnected) {
+        // Immediately write/update presence as online/active upon successful connection/reconnect
+        update(participantRef, {
+          isOnline: true,
+          username: profile.username,
+          photoURL: profile.photoURL || "",
+          lastActive: Date.now()
+        }).catch(() => {});
+
+        // Re-register onDisconnect handler because Firebase disconnect triggers are connection-specific
+        onDisconnect(participantRef).update({
+          isOnline: false,
+          lastActive: Date.now()
+        }).catch(() => {});
       }
     };
-  }, [roomCode, user, profile]);
+
+    onValue(connectedRef, handleConnectionChange);
+
+    // Also touch presence on browser online event and window focus to guarantee immediate recovery
+    const handleBrowserOnlineOrFocus = () => {
+      if (navigator.onLine) {
+        update(participantRef, {
+          isOnline: true,
+          lastActive: Date.now()
+        }).catch(() => {});
+      }
+    };
+
+    window.addEventListener("online", handleBrowserOnlineOrFocus);
+    window.addEventListener("focus", handleBrowserOnlineOrFocus);
+    document.addEventListener("visibilitychange", handleBrowserOnlineOrFocus);
+
+    return () => {
+      off(connectedRef, "value", handleConnectionChange);
+      window.removeEventListener("online", handleBrowserOnlineOrFocus);
+      window.removeEventListener("focus", handleBrowserOnlineOrFocus);
+      document.removeEventListener("visibilitychange", handleBrowserOnlineOrFocus);
+
+      // Cancel onDisconnect on clean component teardown
+      onDisconnect(participantRef).cancel().catch(() => {});
+    };
+  }, [roomCode, user?.uid, profile?.username, profile?.photoURL]);
 
   // Post system message when current user joins
   useEffect(() => {
@@ -245,30 +375,45 @@ export function WatchRoom({ roomCode, initialOfflineFile, onLeaveRoom }: WatchRo
     }
   }, [user, profile, roomCode, postSystemMessage]);
 
-  // Post system message when current user leaves (clean exit)
+  // Persist final room playback timeline on unmount
   useEffect(() => {
     return () => {
       if (user && profile && roomCode) {
-        const chatRef = ref(rtdb, `rooms/${roomCode}/chat`);
-        const newMsgRef = push(chatRef);
-        set(newMsgRef, {
-          id: newMsgRef.key || Date.now().toString(),
-          uid: "system",
-          username: "System",
-          type: "system",
-          text: `@${profile.username} has left the room.`,
-          createdAt: Date.now()
-        }).catch(() => {});
+        // Save latest valid video playback timeline so rejoining resumes at last valid position
+        if (latestPlaybackStateRef.current && (isHost || !controlsLockedRef.current)) {
+          const lastPlayback = latestPlaybackStateRef.current;
+          if (lastPlayback.currentTime > 0) {
+            const playbackRef = ref(rtdb, `rooms/${roomCode}/playbackState`);
+            update(playbackRef, {
+              isPlaying: lastPlayback.isPlaying,
+              currentTime: lastPlayback.currentTime,
+              lastUpdated: Date.now(),
+              updatedBy: user.uid,
+              updatedByUsername: profile.username
+            }).catch(() => {});
+          }
+        }
       }
     };
-  }, [user, profile, roomCode]);
+  }, [user, profile, roomCode, isHost]);
 
-  // Track other participants' online status changes for abrupt leaves
+  // Track other participants' online status changes for abrupt disconnects
   useEffect(() => {
     if (!room || !room.participants || !user) return;
 
     const currentParticipants = room.participants;
     const prevParticipants = prevParticipantsRef.current;
+
+    // On the first snapshot, simply record initial participant states without emitting any messages
+    if (!isInitialSnapshotRef.current) {
+      isInitialSnapshotRef.current = true;
+      const initialStatuses: Record<string, boolean> = {};
+      Object.entries(currentParticipants).forEach(([uid, p]) => {
+        initialStatuses[uid] = !!p.isOnline;
+      });
+      prevParticipantsRef.current = initialStatuses;
+      return;
+    }
 
     const isHostOnline = room.participants[room.adminUid]?.isOnline;
     const isCurrentUserHost = user.uid === room.adminUid;
@@ -278,6 +423,7 @@ export function WatchRoom({ roomCode, initialOfflineFile, onLeaveRoom }: WatchRo
       .sort((a, b) => a.uid.localeCompare(b.uid));
 
     const isResponsibleForOthers = isCurrentUserHost || (!isHostOnline && activeParticipants[0]?.uid === user.uid);
+    const now = Date.now();
 
     Object.entries(currentParticipants).forEach(([uid, p]) => {
       if (uid === user.uid) return;
@@ -286,8 +432,21 @@ export function WatchRoom({ roomCode, initialOfflineFile, onLeaveRoom }: WatchRo
       const isOnline = p.isOnline === true;
 
       if (wasOnline && !isOnline) {
-        if (isResponsibleForOthers) {
-          postSystemMessage(`@${p.username} has left the room.`);
+        const lastActive = p.lastActive || 0;
+        const lastLeaveMsgTime = p.lastLeaveMsgTime || 0;
+        const lastRecord = lastPresenceMessageTimestampRef.current[uid];
+
+        // Check if a leave message was already recorded or sent for this leave transition
+        const alreadyProcessedLocally = lastRecord?.lastActive === lastActive;
+        const alreadyProcessedInRTDB = lastLeaveMsgTime > 0 && Math.abs(lastLeaveMsgTime - lastActive) < 10000;
+
+        if (!alreadyProcessedLocally && !alreadyProcessedInRTDB) {
+          lastPresenceMessageTimestampRef.current[uid] = { status: false, time: now, lastActive };
+          if (isResponsibleForOthers) {
+            const pRef = ref(rtdb, `rooms/${roomCode}/participants/${uid}`);
+            update(pRef, { lastLeaveMsgTime: now }).catch(() => {});
+            postSystemMessage(`@${p.username} has left the room.`);
+          }
         }
       }
     });
@@ -301,10 +460,15 @@ export function WatchRoom({ roomCode, initialOfflineFile, onLeaveRoom }: WatchRo
 
 // Sync state emitter from VideoPlayer
   const handlePlaybackChange = useCallback((state: { isPlaying: boolean; currentTime: number }) => {
-    if (!room || !user || !profile) return;
-    if (room.controlsLocked && !isHost) return;
-
+    if (!user || !profile || !roomCode) return;
     const now = Date.now();
+    latestPlaybackStateRef.current = {
+      isPlaying: state.isPlaying,
+      currentTime: state.currentTime,
+      lastUpdated: now
+    };
+    if (controlsLockedRef.current && !isHost) return;
+
     // Throttle frequent updates to avoid spamming RTDB
     lastSyncWriteTime.current = now;
 
@@ -316,12 +480,12 @@ export function WatchRoom({ roomCode, initialOfflineFile, onLeaveRoom }: WatchRo
       updatedBy: user.uid,
       updatedByUsername: profile.username
     }).catch(console.error);
-  }, [room?.controlsLocked, isHost, roomCode, user, profile]);
+  }, [isHost, roomCode, user, profile]);
 
   // Audio track sync
   const handleAudioTrackChange = useCallback((index: number) => {
-    if (!room || !user || !profile) return;
-    if (room.controlsLocked && !isHost) return;
+    if (!user || !profile || !roomCode) return;
+    if (controlsLockedRef.current && !isHost) return;
 
     const playbackRef = ref(rtdb, `rooms/${roomCode}/playbackState`);
     update(playbackRef, {
@@ -330,21 +494,58 @@ export function WatchRoom({ roomCode, initialOfflineFile, onLeaveRoom }: WatchRo
       updatedBy: user.uid,
       updatedByUsername: profile.username
     }).catch(console.error);
-  }, [room?.controlsLocked, isHost, roomCode, user, profile]);
+  }, [isHost, roomCode, user, profile]);
 
-  // Admin toggling control lock
+  // Admin toggling control lock (UI permission state only)
   const handleToggleControlLock = async () => {
     if (!isHost || !room) return;
     const roomRef = ref(rtdb, `rooms/${roomCode}`);
     await update(roomRef, {
       controlsLocked: !room.controlsLocked
-    });
+    }).catch(console.error);
   };
+
+  // Series Episode / Season Selection handler with RTDB synchronization
+  const handleSelectEpisode = useCallback((seasonNum: number, episodeNum: number, episodeUrl: string) => {
+    if (!roomCode) return;
+    const canControl = isHost || !controlsLockedRef.current;
+    if (!canControl) return;
+
+    const roomRef = ref(rtdb, `rooms/${roomCode}`);
+    const now = Date.now();
+    update(roomRef, {
+      season: seasonNum,
+      episode: episodeNum,
+      currentEpisodeUrl: episodeUrl,
+      playbackState: {
+        isPlaying: true,
+        currentTime: 0,
+        lastUpdated: now,
+        updatedBy: user?.uid || "unknown",
+        audioTrackIndex: 0
+      }
+    }).catch(console.error);
+
+    postSystemMessage(`Switched to Season ${seasonNum}, Episode ${episodeNum}`);
+  }, [isHost, roomCode, user?.uid, postSystemMessage]);
 
   // Handle movie natural completion
   const handleVideoEnded = useCallback(async () => {
     if (!roomCode) return;
     try {
+      // Auto-advance if this is a series and there is a next episode in this season
+      if (roomSeriesStructure && roomSeriesStructure.isSeries && room) {
+        const currentSeasonNum = room.season || 1;
+        const currentEpNum = room.episode || 1;
+        const currentSeasonData = roomSeriesStructure.seasons.find((s) => s.seasonNumber === currentSeasonNum);
+        const nextEp = currentSeasonData?.episodes.find((ep) => ep.episodeNumber === currentEpNum + 1);
+
+        if (nextEp && isHost) {
+          handleSelectEpisode(currentSeasonNum, nextEp.episodeNumber, nextEp.url);
+          return;
+        }
+      }
+
       // 1. Mark movie as completed
       const roomRef = ref(rtdb, `rooms/${roomCode}`);
       await update(roomRef, {
@@ -352,13 +553,13 @@ export function WatchRoom({ roomCode, initialOfflineFile, onLeaveRoom }: WatchRo
         "playbackState/isPlaying": false
       });
 
-      // 2. Clear room chat/voice notes as required in Section 16 & 17
+      // 2. Clear room chat as required
       const chatRef = ref(rtdb, `rooms/${roomCode}/chat`);
       await set(chatRef, null);
     } catch (err) {
       console.error("Error finalizing completed movie:", err);
     }
-  }, [roomCode]);
+  }, [roomCode, roomSeriesStructure, room, isHost, handleSelectEpisode]);
 
   // Replay movie option for host
   const handleReplayMovie = async () => {
@@ -399,6 +600,8 @@ export function WatchRoom({ roomCode, initialOfflineFile, onLeaveRoom }: WatchRo
     }
     copyRoomCode();
   };
+
+
 
   // Handle participant selecting their offline file
   const handleOfflineFileSelect = async (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -465,7 +668,7 @@ export function WatchRoom({ roomCode, initialOfflineFile, onLeaveRoom }: WatchRo
         <h3 className="text-xl font-bold font-heading text-white mb-2">Room Inactive</h3>
         <p className="text-sm text-neutral-400 mb-6">{error || "This watch room is no longer accessible."}</p>
         <button
-          onClick={onLeaveRoom}
+          onClick={handleExplicitLeaveRoom}
           className="px-6 py-2.5 bg-neutral-800 hover:bg-neutral-700 text-white text-xs font-semibold rounded-xl transition flex items-center gap-2"
         >
           <ArrowLeft className="w-4 h-4" />
@@ -485,7 +688,7 @@ export function WatchRoom({ roomCode, initialOfflineFile, onLeaveRoom }: WatchRo
       <div className="flex flex-wrap items-center justify-between gap-3 p-3 bg-neutral-900/90 border border-neutral-800 rounded-2xl backdrop-blur-md shadow-xl">
         <div className="flex items-center gap-3">
           <button
-            onClick={onLeaveRoom}
+            onClick={handleExplicitLeaveRoom}
             className="p-2 text-neutral-400 hover:text-white rounded-xl hover:bg-neutral-800 transition flex items-center gap-1.5 text-xs font-semibold"
             title="Leave Room"
           >
@@ -626,7 +829,7 @@ export function WatchRoom({ roomCode, initialOfflineFile, onLeaveRoom }: WatchRo
               )}
               <input
                 type="file"
-                accept="video/*"
+                accept="video/*,.mp4,.mkv,.mov,.avi,.webm,.m4v,.flv,.wmv,.3gp,.ts,.m2ts"
                 disabled={isExtractingDuration}
                 className="hidden"
                 onChange={handleOfflineFileSelect}
@@ -640,28 +843,8 @@ export function WatchRoom({ roomCode, initialOfflineFile, onLeaveRoom }: WatchRo
               <span>{offlineDurationError}</span>
             </div>
           )}
-
-          <div className="p-3 bg-emerald-500/10 border border-emerald-500/30 rounded-xl text-[11px] flex flex-col gap-1 sm:gap-1.5 mt-2">
-            <p className="font-semibold text-emerald-400 flex items-center gap-1.5">
-              <Smartphone className="w-4 h-4 shrink-0 text-emerald-400" />
-              Using Android?
-            </p>
-            <p className="text-neutral-300 leading-relaxed">
-              Android Chrome has limited video codec support. For the best playback experience and codec compatibility, we highly recommend downloading and installing our native Android app:
-            </p>
-            <a
-              href="https://github.com/jinwoo-09/muvidate/releases/download/1.0/Muvidate_1.0.apk"
-              target="_blank"
-              rel="noopener noreferrer"
-              className="text-emerald-400 hover:text-emerald-300 font-semibold underline break-all"
-            >
-              https://github.com/jinwoo-09/muvidate/releases/download/1.0/Muvidate_1.0.apk
-            </a>
-          </div>
         </div>
       )}
-
-      {/* Movie Completed Banner */}
       {room.movieCompleted && (
         <div className="p-5 bg-gradient-to-r from-neutral-900 to-neutral-850 border border-neutral-750 rounded-2xl shadow-xl flex flex-col sm:flex-row items-center justify-between gap-4">
           <div className="flex items-center gap-3">
@@ -671,7 +854,7 @@ export function WatchRoom({ roomCode, initialOfflineFile, onLeaveRoom }: WatchRo
             <div>
               <h4 className="text-base font-bold text-white">The movie has finished!</h4>
               <p className="text-xs text-neutral-400 mt-0.5">
-                Watch session ended. Real-time chat & voice notes have been cleared.
+                Watch session ended. Real-time chat has been cleared.
               </p>
             </div>
           </div>
@@ -693,7 +876,7 @@ export function WatchRoom({ roomCode, initialOfflineFile, onLeaveRoom }: WatchRo
               </button>
             )}
             <button
-              onClick={onLeaveRoom}
+              onClick={handleExplicitLeaveRoom}
               className="px-4 py-2 bg-neutral-800 hover:bg-neutral-700 text-neutral-300 hover:text-white text-xs font-semibold rounded-xl transition"
             >
               Browse Movies
@@ -705,10 +888,10 @@ export function WatchRoom({ roomCode, initialOfflineFile, onLeaveRoom }: WatchRo
       {/* Main Watch Room Grid: Video Player (Left) + Chat / Participants (Right) */}
       <div className="grid grid-cols-1 lg:grid-cols-12 gap-4 items-start">
         {/* Video Player Column */}
-        <div className="contents lg:block lg:col-span-8 lg:space-y-4">
+        <div className="w-full lg:col-span-8 space-y-3 sm:space-y-4">
           {/* Sticky Video Player Container - Pinned at top-0 with z-9999 only once scrolled to top */}
           <div
-            className="sticky top-0 z-[9999] bg-neutral-950/95 py-2 -mx-1 px-1 rounded-2xl"
+            className={`sticky top-0 z-[9999] ${isOfflineSource ? "bg-transparent" : "bg-neutral-950/95"} py-1.5 sm:py-2 -mx-1 px-1 rounded-2xl watch-room-sticky-player`}
             style={{
               zIndex: 9999,
               top: 0
@@ -726,7 +909,11 @@ export function WatchRoom({ roomCode, initialOfflineFile, onLeaveRoom }: WatchRo
                 onVideoEnded={handleVideoEnded}
                 roomCode={roomCode}
                 currentUserId={user?.uid}
-                isVoiceRecording={isVoiceRecording}
+                seriesStructure={roomSeriesStructure}
+                currentSeason={room.season || 1}
+                currentEpisode={room.episode || 1}
+                onSelectEpisode={handleSelectEpisode}
+                subtitle={effectiveSubtitle}
               />
             ) : (
               <div className="w-full aspect-video bg-neutral-900/90 border border-neutral-800 rounded-2xl flex flex-col items-center justify-center p-6 text-center">
@@ -753,7 +940,14 @@ export function WatchRoom({ roomCode, initialOfflineFile, onLeaveRoom }: WatchRo
                 <Film className="w-4 h-4" />
               </div>
               <div>
-                <p className="font-bold text-white">{room.movieTitle}</p>
+                <div className="flex items-center gap-2 flex-wrap">
+                  <p className="font-bold text-white">{room.movieTitle}</p>
+                  {roomSeriesStructure?.isSeries && (
+                    <span className="px-2 py-0.5 rounded-md bg-rose-500/20 text-rose-300 text-[10px] font-semibold border border-rose-500/30">
+                      S{room.season || 1} : EP{room.episode || 1}
+                    </span>
+                  )}
+                </div>
                 <p className="text-neutral-400 text-[11px]">
                   Hosted by <span className="text-neutral-200">@{room.adminUsername}</span>
                 </p>
@@ -777,7 +971,7 @@ export function WatchRoom({ roomCode, initialOfflineFile, onLeaveRoom }: WatchRo
         </div>
 
         {/* Chat & Participants Column */}
-        <div className="lg:col-span-4 flex flex-col h-[520px] lg:h-[550px] lg:max-h-[70vh] min-h-[480px]">
+        <div className="w-full lg:col-span-4 flex flex-col h-[460px] sm:h-[520px] lg:h-[550px] lg:max-h-[70vh] min-h-[360px] sm:min-h-[480px]">
           {/* Tabs for Mobile/Desktop */}
           <div className="flex items-center gap-1 p-1 bg-neutral-950 rounded-xl border border-neutral-800 mb-2">
             <button
@@ -812,7 +1006,6 @@ export function WatchRoom({ roomCode, initialOfflineFile, onLeaveRoom }: WatchRo
                 roomCode={roomCode}
                 adminUid={room.adminUid}
                 isMovieCompleted={room.movieCompleted}
-                onRecordingStateChange={setIsVoiceRecording}
               />
             ) : (
               <div className="h-full bg-neutral-900/90 border border-neutral-800 rounded-2xl p-4 overflow-y-auto">

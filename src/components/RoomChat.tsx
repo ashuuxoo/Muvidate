@@ -1,31 +1,41 @@
 import React, { useState, useEffect, useRef } from "react";
 import { useAuth } from "../context/AuthContext";
-import { rtdb } from "../lib/firebase";
-import { ref, onValue, off, push, set } from "firebase/database";
+import { rtdb, getUserProfile } from "../lib/firebase";
+import { ref, onValue, off, push, set, update } from "firebase/database";
 import { ChatMessage } from "../types";
-import { VoiceNoteRecorder } from "./VoiceNoteRecorder";
-import { VoiceNotePlayer } from "./VoiceNotePlayer";
-import { Send, MessageSquare, Shield, Smile, X } from "lucide-react";
+import { Send, MessageSquare, Shield, X } from "lucide-react";
+
+// In-memory cache for user avatars across the app session to avoid redundant Firestore queries
+const avatarMemoryCache = new Map<string, string>();
+const pendingFetches = new Set<string>();
 
 interface RoomChatProps {
   roomCode: string;
   adminUid: string;
   isMovieCompleted: boolean;
-  onRecordingStateChange?: (isRecording: boolean) => void;
 }
 
 export function RoomChat({ 
   roomCode, 
   adminUid, 
-  isMovieCompleted,
-  onRecordingStateChange 
+  isMovieCompleted
 }: RoomChatProps) {
   const { user, profile } = useAuth();
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [inputText, setInputText] = useState("");
   const [isSending, setIsSending] = useState(false);
-  const messagesEndRef = useRef<HTMLDivElement>(null);
+  const messagesContainerRef = useRef<HTMLDivElement>(null);
+  const chatInputRef = useRef<HTMLInputElement>(null);
+  const [keyboardOffset, setKeyboardOffset] = useState(0);
   const [selectedAvatar, setSelectedAvatar] = useState<{ username: string; photoURL: string; initials: string } | null>(null);
+  const [, setAvatarCacheVersion] = useState(0);
+
+  // Synchronize current user's avatar into cache
+  useEffect(() => {
+    if (user?.uid && profile?.photoURL) {
+      avatarMemoryCache.set(user.uid, profile.photoURL);
+    }
+  }, [user?.uid, profile?.photoURL]);
 
   useEffect(() => {
     const chatRef = ref(rtdb, `rooms/${roomCode}/chat`);
@@ -37,10 +47,12 @@ export function RoomChat({
         return;
       }
 
-      const list: ChatMessage[] = Object.keys(val).map((k) => ({
-        id: k,
-        ...val[k]
-      }));
+      const list: ChatMessage[] = Object.keys(val)
+        .map((k) => ({
+          id: k,
+          ...val[k]
+        }))
+        .filter((m) => m.type === "system" || (m.type === "text" && typeof m.text === "string" && m.text.trim() !== ""));
 
       // Sort chronologically by createdAt
       list.sort((a, b) => (a.createdAt || 0) - (b.createdAt || 0));
@@ -54,12 +66,96 @@ export function RoomChat({
     };
   }, [roomCode]);
 
+  // Resolve avatars for message senders using cached lookups from user profile data
   useEffect(() => {
-    messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
+    if (messages.length === 0) return;
+
+    let hasNewFetches = false;
+    messages.forEach((msg) => {
+      if (!msg.uid || msg.uid === "system") return;
+
+      // If message already has a photoURL, populate cache
+      if (msg.photoURL && typeof msg.photoURL === "string" && msg.photoURL.trim() !== "") {
+        if (!avatarMemoryCache.has(msg.uid)) {
+          avatarMemoryCache.set(msg.uid, msg.photoURL);
+        }
+        return;
+      }
+
+      // If not in cache and not already fetching, fetch sender's profile from Firestore
+      if (!avatarMemoryCache.has(msg.uid) && !pendingFetches.has(msg.uid)) {
+        pendingFetches.add(msg.uid);
+        hasNewFetches = true;
+
+        getUserProfile(msg.uid)
+          .then((prof) => {
+            const photo = prof?.photoURL || "";
+            avatarMemoryCache.set(msg.uid, photo);
+            setAvatarCacheVersion((v) => v + 1);
+          })
+          .catch((err) => {
+            console.warn(`Failed to resolve avatar for user ${msg.uid}:`, err);
+            avatarMemoryCache.set(msg.uid, "");
+          })
+          .finally(() => {
+            pendingFetches.delete(msg.uid);
+          });
+      }
+    });
   }, [messages]);
+
+  // Scroll only the message container internally to bottom, never scrolling the entire page or moving video player
+  useEffect(() => {
+    if (messagesContainerRef.current) {
+      messagesContainerRef.current.scrollTop = messagesContainerRef.current.scrollHeight;
+    }
+  }, [messages]);
+
+  // Visual viewport tracking for mobile virtual keyboards (iOS Safari and Android Chrome)
+  useEffect(() => {
+    if (typeof window === "undefined" || !window.visualViewport) return;
+
+    const handleVisualViewport = () => {
+      const vv = window.visualViewport;
+      if (!vv) return;
+
+      const layoutHeight = window.innerHeight;
+      const visualHeight = vv.height;
+      const offset = Math.max(0, layoutHeight - (visualHeight + (vv.offsetTop || 0)));
+
+      // If the keyboard is open (offset > 40px), track offset so input sits above it
+      setKeyboardOffset(offset > 40 ? offset : 0);
+
+      if (document.activeElement === chatInputRef.current) {
+        requestAnimationFrame(() => {
+          if (messagesContainerRef.current) {
+            messagesContainerRef.current.scrollTop = messagesContainerRef.current.scrollHeight;
+          }
+        });
+      }
+    };
+
+    const vv = window.visualViewport;
+    vv.addEventListener("resize", handleVisualViewport);
+    vv.addEventListener("scroll", handleVisualViewport);
+
+    return () => {
+      vv.removeEventListener("resize", handleVisualViewport);
+      vv.removeEventListener("scroll", handleVisualViewport);
+    };
+  }, []);
+
+  const handleInputFocus = () => {
+    setTimeout(() => {
+      if (messagesContainerRef.current) {
+        messagesContainerRef.current.scrollTop = messagesContainerRef.current.scrollHeight;
+      }
+    }, 200);
+  };
 
   const handleSendMessage = async (e: React.FormEvent) => {
     e.preventDefault();
+    e.stopPropagation();
     const text = inputText.trim();
     if (!text || !user || !profile || isSending || isMovieCompleted) return;
 
@@ -67,38 +163,30 @@ export function RoomChat({
     try {
       const chatRef = ref(rtdb, `rooms/${roomCode}/chat`);
       const newMsgRef = push(chatRef);
+      const photoURL = profile.photoURL || avatarMemoryCache.get(user.uid) || "";
       const msg: ChatMessage = {
         id: newMsgRef.key || Date.now().toString(),
         uid: user.uid,
         username: profile.username,
-        photoURL: profile.photoURL || "",
+        photoURL,
         type: "text",
         text,
         createdAt: Date.now()
       };
       await set(newMsgRef, msg);
       setInputText("");
+
+      // Ensure user presence is active in the room upon sending message
+      const participantRef = ref(rtdb, `rooms/${roomCode}/participants/${user.uid}`);
+      update(participantRef, {
+        isOnline: true,
+        lastActive: Date.now()
+      }).catch(() => {});
     } catch (err) {
       console.error("Send message error:", err);
     } finally {
       setIsSending(false);
     }
-  };
-
-  const handleVoiceNoteUploaded = async (audioUrl: string) => {
-    if (!user || !profile || isMovieCompleted) return;
-    const chatRef = ref(rtdb, `rooms/${roomCode}/chat`);
-    const newMsgRef = push(chatRef);
-    const msg: ChatMessage = {
-      id: newMsgRef.key || Date.now().toString(),
-      uid: user.uid,
-      username: profile.username,
-      photoURL: profile.photoURL || "",
-      type: "voice",
-      audioUrl,
-      createdAt: Date.now()
-    };
-    await set(newMsgRef, msg);
   };
 
   const formatTime = (timestamp?: number) => {
@@ -121,17 +209,21 @@ export function RoomChat({
       </div>
 
       {/* Messages List */}
-      <div className="flex-1 overflow-y-auto p-3 sm:p-4 space-y-3.5 min-h-[220px]">
+      <div 
+        ref={messagesContainerRef}
+        className="flex-1 overflow-y-auto p-3 sm:p-4 space-y-3.5 min-h-[160px] overscroll-contain"
+        style={{ WebkitOverflowScrolling: "touch" }}
+      >
         {isMovieCompleted ? (
           <div className="flex flex-col items-center justify-center h-full text-center p-6 text-neutral-500">
             <p className="text-sm font-semibold text-neutral-300">Session Ended</p>
-            <p className="text-xs mt-1">Chat and voice notes are closed because the movie has finished.</p>
+            <p className="text-xs mt-1">Chat is closed because the movie has finished.</p>
           </div>
         ) : messages.length === 0 ? (
           <div className="flex flex-col items-center justify-center h-full text-center p-6 text-neutral-500">
             <MessageSquare className="w-8 h-8 stroke-1 text-neutral-600 mb-2" />
             <p className="text-sm font-medium text-neutral-300">Be the first to say something.</p>
-            <p className="text-xs text-neutral-500 mt-1">Send a message or voice note to your watch party.</p>
+            <p className="text-xs text-neutral-500 mt-1">Send a message to your watch party.</p>
           </div>
         ) : (
           messages.map((msg) => {
@@ -153,6 +245,13 @@ export function RoomChat({
             const isMe = msg.uid === user?.uid;
             const isHost = msg.uid === adminUid;
             const initials = msg.username ? msg.username.slice(0, 2).toUpperCase() : "U";
+            
+            // Resolve effective photo URL from message or cached user profile
+            const effectivePhotoURL =
+              msg.photoURL ||
+              avatarMemoryCache.get(msg.uid) ||
+              (isMe ? profile?.photoURL : "") ||
+              "";
 
             return (
               <div
@@ -163,14 +262,14 @@ export function RoomChat({
                 <div 
                   onClick={() => setSelectedAvatar({
                     username: msg.username,
-                    photoURL: msg.photoURL || "",
+                    photoURL: effectivePhotoURL,
                     initials
                   })}
                   className="w-7 h-7 rounded-full overflow-hidden bg-neutral-800 shrink-0 border border-neutral-700 flex items-center justify-center text-[10px] font-bold text-neutral-300 shadow-sm mt-0.5 cursor-pointer hover:scale-105 active:scale-95 transition"
                 >
-                  {msg.photoURL ? (
+                  {effectivePhotoURL ? (
                     <img
-                      src={msg.photoURL}
+                      src={effectivePhotoURL}
                       alt={msg.username}
                       className="w-full h-full object-cover"
                       referrerPolicy="no-referrer"
@@ -196,48 +295,51 @@ export function RoomChat({
                     </span>
                   </div>
 
-                  {msg.type === "voice" && msg.audioUrl ? (
-                    <VoiceNotePlayer audioUrl={msg.audioUrl} />
-                  ) : (
-                    <div
-                      className={`px-3.5 py-2 rounded-2xl text-xs leading-relaxed break-words shadow-sm ${
-                        isMe
-                          ? "bg-rose-600 text-white rounded-tr-sm"
-                          : "bg-neutral-800 text-neutral-100 rounded-tl-sm border border-neutral-750"
-                      }`}
-                    >
-                      {msg.text}
-                    </div>
-                  )}
+                  <div
+                    className={`px-3.5 py-2 rounded-2xl text-xs leading-relaxed break-words shadow-sm ${
+                      isMe
+                        ? "bg-rose-600 text-white rounded-tr-sm"
+                        : "bg-neutral-800 text-neutral-100 rounded-tl-sm border border-neutral-750"
+                    }`}
+                  >
+                    {msg.text}
+                  </div>
                 </div>
               </div>
             );
           })
         )}
-        <div ref={messagesEndRef} />
       </div>
 
-      {/* Message Input & Voice Note */}
-      <div className="p-2.5 sm:p-3 border-t border-neutral-800 bg-neutral-950/80">
+      {/* Message Input */}
+      <div 
+        className="p-2.5 sm:p-3 border-t border-neutral-800 bg-neutral-950/95 transition-all duration-150"
+        style={{
+          paddingBottom: keyboardOffset > 0 
+            ? `${keyboardOffset + 8}px` 
+            : "max(0.625rem, env(safe-area-inset-bottom, 0px))"
+        }}
+      >
         {isMovieCompleted ? (
           <p className="text-center text-xs text-neutral-500 py-1">
             Chat is disabled (movie session ended).
           </p>
         ) : (
-          <form onSubmit={handleSendMessage} className="flex items-center gap-2">
-            <VoiceNoteRecorder
-              onVoiceNoteUploaded={handleVoiceNoteUploaded}
-              onRecordingStateChange={onRecordingStateChange}
-              disabled={isMovieCompleted}
-            />
+          <form 
+            onSubmit={handleSendMessage} 
+            action="#" 
+            className="flex items-center gap-2"
+          >
 
             <input
+              ref={chatInputRef}
               type="text"
               value={inputText}
               onChange={(e) => setInputText(e.target.value)}
+              onFocus={handleInputFocus}
               placeholder="Type a message..."
               disabled={isMovieCompleted}
-              className="flex-1 px-3 py-2 bg-neutral-900 border border-neutral-750 rounded-xl text-xs text-white placeholder-neutral-500 focus:outline-none focus:ring-1 focus:ring-rose-500 transition"
+              className="flex-1 px-3 py-2 bg-neutral-900 border border-neutral-750 rounded-xl text-base sm:text-xs text-white placeholder-neutral-500 focus:outline-none focus:ring-1 focus:ring-rose-500 transition"
             />
 
             <button

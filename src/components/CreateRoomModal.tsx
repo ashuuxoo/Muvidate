@@ -8,6 +8,7 @@ import {
 import { ref, set } from "firebase/database";
 import { Movie, Room } from "../types";
 import { getVideoDuration, formatVideoTime } from "../lib/videoUtils";
+import { extractSeriesStructure } from "../lib/seriesUtils";
 import { 
   X, 
   Tv, 
@@ -19,8 +20,7 @@ import {
   Sparkles,
   Lock,
   Search,
-  Check,
-  Smartphone
+  Check
 } from "lucide-react";
 
 interface CreateRoomModalProps {
@@ -123,6 +123,7 @@ export function CreateRoomModal({
       let movieId = "";
       let offlineFileName = "";
       let offlineDuration: number | undefined = undefined;
+      let foundMovie: Movie | undefined = undefined;
 
       if (sourceType === "firestore") {
         const found = movies.find((m) => m.id === selectedMovieId);
@@ -131,6 +132,7 @@ export function CreateRoomModal({
           setIsCreating(false);
           return;
         }
+        foundMovie = found;
         movieId = found.id;
         movieTitle = found.Title;
         moviePoster = (found.cover && found.cover.trim() !== "") ? found.cover : (found.poster || "");
@@ -200,6 +202,9 @@ export function CreateRoomModal({
       if (moviePoster) {
         roomData.moviePoster = moviePoster;
       }
+      if (foundMovie && foundMovie.subtitle && foundMovie.subtitle.trim()) {
+        roomData.subtitle = foundMovie.subtitle.trim();
+      }
       if (sourceType === "offline") {
         if (offlineFileName) {
           roomData.offlineFileName = offlineFileName;
@@ -209,11 +214,39 @@ export function CreateRoomModal({
         }
       }
 
+      // Check if media is a TV series and populate initial season/episode
+      const detectedSeries =
+        sourceType === "firestore" && foundMovie
+          ? extractSeriesStructure(foundMovie)
+          : sourceType === "direct"
+          ? extractSeriesStructure(directUrl.trim())
+          : null;
+
+      if (detectedSeries && detectedSeries.isSeries) {
+        roomData.season = 1;
+        roomData.episode = 1;
+        roomData.currentEpisodeUrl = detectedSeries.seasons[0]?.episodes[0]?.url || movieUrl;
+        if (sourceType === "firestore" && foundMovie) {
+          // Copy all season URLs and subtitle fields
+          for (const k of Object.keys(foundMovie)) {
+            if (/^url\d*$/i.test(k) && typeof (foundMovie as any)[k] === "string" && (foundMovie as any)[k].trim()) {
+              roomData[k] = (foundMovie as any)[k].trim();
+            }
+            if (/^subtitle\d*$/i.test(k) && typeof (foundMovie as any)[k] === "string" && (foundMovie as any)[k].trim()) {
+              roomData[k] = (foundMovie as any)[k].trim();
+            }
+          }
+        } else if (sourceType === "direct") {
+          roomData.seriesUrls = directUrl.trim();
+        }
+      }
+
       // Save room to Realtime Database
       const roomRef = ref(rtdb, `rooms/${roomCode}`);
       await set(roomRef, roomData);
 
-      onRoomCreated(roomCode, offlineFile || undefined);
+      const passOffline = offlineFile || undefined;
+      onRoomCreated(roomCode, passOffline);
     } catch (err: any) {
       console.error("Room creation error:", err);
       setError(err.message || "Failed to create watch room. Please try again.");
@@ -241,7 +274,7 @@ export function CreateRoomModal({
           <div>
             <h3 className="text-xl font-bold font-heading text-white">Create Watch Room</h3>
             <p className="text-xs text-neutral-400">
-              Watch together in real-time with synchronized playback, live chat & voice notes.
+              Watch together in real-time with synchronized playback and live chat.
             </p>
           </div>
         </div>
@@ -411,18 +444,18 @@ export function CreateRoomModal({
               </div>
               <div>
                 <label className="block text-xs font-semibold uppercase tracking-wider text-neutral-300 mb-1">
-                  Direct Video URL (MP4 / WebM) *
+                  Direct Video or HLS URL (MP4 / M3U8 / WebM) *
                 </label>
                 <input
                   type="url"
                   required
                   value={directUrl}
                   onChange={(e) => setDirectUrl(e.target.value)}
-                  placeholder="https://example.com/video.mp4"
+                  placeholder="https://example.com/video.mp4 or stream.m3u8"
                   className="w-full px-3.5 py-2.5 bg-neutral-950 border border-neutral-700 rounded-xl text-white placeholder-neutral-500 focus:outline-none focus:ring-2 focus:ring-rose-500 text-sm"
                 />
                 <p className="text-xs text-neutral-500 mt-1">
-                  Ensure the direct video link is publicly accessible via HTTPS.
+                  Supports direct MP4 and HLS (.m3u8) adaptive streams. Ensure the link is publicly accessible via HTTPS.
                 </p>
               </div>
             </div>
@@ -446,31 +479,13 @@ export function CreateRoomModal({
                 </label>
                 <input
                   type="file"
-                  accept="video/*"
+                  accept="video/*,.mp4,.mkv,.mov,.avi,.webm,.m4v,.flv,.wmv,.3gp,.ts,.m2ts"
                   onChange={(e) => {
                     const file = e.target.files?.[0];
                     if (file) setOfflineFile(file);
                   }}
                   className="w-full text-xs text-neutral-400 file:mr-3 file:py-2 file:px-4 file:rounded-xl file:border-0 file:text-xs file:font-semibold file:bg-neutral-800 file:text-white hover:file:bg-neutral-700 cursor-pointer"
                 />
-              </div>
-
-              <div className="p-3 bg-emerald-500/10 border border-emerald-500/30 rounded-xl text-[11px] flex flex-col gap-1.5 mt-2">
-                <p className="font-semibold text-emerald-400 flex items-center gap-1.5">
-                  <Smartphone className="w-4 h-4 shrink-0 text-emerald-400" />
-                  Using Android?
-                </p>
-                <p className="text-neutral-300 leading-relaxed">
-                  Android Chrome has limited video codec support. For the best playback experience and codec compatibility, we highly recommend downloading and installing our native Android app:
-                </p>
-                <a
-                  href="https://github.com/jinwoo-09/muvidate/releases/download/1.0/Muvidate_1.0.apk"
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  className="text-emerald-400 hover:text-emerald-300 font-semibold underline break-all"
-                >
-                  https://github.com/jinwoo-09/muvidate/releases/download/1.0/Muvidate_1.0.apk
-                </a>
               </div>
 
               {offlineFile && (

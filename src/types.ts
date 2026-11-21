@@ -18,6 +18,11 @@ export interface Movie {
   poster: string;
   cover?: string;
   url: string;
+  url2?: string;
+  url3?: string;
+  subtitle?: string;
+  trailer?: string;
+  [key: string]: any;
   createdAt?: any;
 }
 
@@ -37,6 +42,8 @@ export interface RoomParticipant {
   joinedAt: number;
   isOnline: boolean;
   hasOfflineFile?: boolean;
+  lastActive?: number;
+  lastLeaveMsgTime?: number;
 }
 
 export interface ChatMessage {
@@ -44,9 +51,8 @@ export interface ChatMessage {
   uid: string;
   username: string;
   photoURL?: string;
-  type: 'text' | 'voice' | 'system';
+  type: 'text' | 'system';
   text?: string;
-  audioUrl?: string;
   createdAt: number;
 }
 
@@ -59,6 +65,11 @@ export interface Room {
   movieTitle: string;
   moviePoster?: string;
   movieUrl: string;
+  season?: number;
+  episode?: number;
+  currentEpisodeUrl?: string;
+  subtitle?: string;
+  seriesUrls?: Record<string, string>;
   offlineFileName?: string;
   offlineDuration?: number;
   playbackState: RoomPlaybackState;

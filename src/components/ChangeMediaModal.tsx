@@ -3,7 +3,8 @@ import { useAuth } from "../context/AuthContext";
 import { rtdb, subscribeToMovies } from "../lib/firebase";
 import { ref, update } from "firebase/database";
 import { Movie } from "../types";
-import { getVideoDuration } from "../lib/videoUtils";
+import { getVideoDuration, formatVideoTime } from "../lib/videoUtils";
+import { extractSeriesStructure } from "../lib/seriesUtils";
 import { 
   X, 
   Film, 
@@ -15,8 +16,7 @@ import {
   Check, 
   Sparkles,
   RefreshCw,
-  Video,
-  Smartphone
+  Video
 } from "lucide-react";
 
 interface ChangeMediaModalProps {
@@ -28,8 +28,6 @@ interface ChangeMediaModalProps {
   controlsLocked: boolean;
   onOfflineFileSelected?: (file: File) => void;
 }
-
-const MAX_MOVIE_SIZE = 1024 * 1024 * 1024; // 1 GB
 
 export function ChangeMediaModal({
   isOpen,
@@ -169,6 +167,7 @@ export function ChangeMediaModal({
         movieUrl = trimmedUrl;
         movieSource = "direct";
       } else if (activeSourceTab === "offline") {
+      } else if (activeSourceTab === "offline") {
         if (!offlineFile) {
           setError("Please choose a local video file from your device.");
           setIsUpdating(false);
@@ -220,6 +219,17 @@ export function ChangeMediaModal({
         updateData.moviePoster = null;
       }
 
+      if (activeSourceTab === "search") {
+        const found = movies.find((m) => m.id === selectedMovieId);
+        if (found && found.subtitle && found.subtitle.trim()) {
+          updateData.subtitle = found.subtitle.trim();
+        } else {
+          updateData.subtitle = null;
+        }
+      } else {
+        updateData.subtitle = null;
+      }
+
       if (movieSource === "offline") {
         if (offlineFileName) {
           updateData.offlineFileName = offlineFileName;
@@ -236,12 +246,46 @@ export function ChangeMediaModal({
         updateData.offlineDuration = null;
       }
 
+      // Check if media is a TV series
+      let seriesStructure = null;
+      if (activeSourceTab === "search") {
+        const found = movies.find((m) => m.id === selectedMovieId);
+        if (found) {
+          seriesStructure = extractSeriesStructure(found);
+          if (seriesStructure.isSeries) {
+            for (const k of Object.keys(found)) {
+              if (/^url\d*$/i.test(k) && typeof (found as any)[k] === "string" && (found as any)[k].trim()) {
+                updateData[k] = (found as any)[k].trim();
+              }
+              if (/^subtitle\d*$/i.test(k) && typeof (found as any)[k] === "string" && (found as any)[k].trim()) {
+                updateData[k] = (found as any)[k].trim();
+              }
+            }
+          }
+        }
+      } else if (activeSourceTab === "direct") {
+        seriesStructure = extractSeriesStructure(directUrl.trim());
+      }
+
+      if (seriesStructure && seriesStructure.isSeries) {
+        updateData.season = 1;
+        updateData.episode = 1;
+        updateData.currentEpisodeUrl = seriesStructure.seasons[0]?.episodes[0]?.url || movieUrl;
+        updateData.seriesUrls = activeSourceTab === "direct" ? directUrl.trim() : movieUrl;
+      } else {
+        updateData.season = null;
+        updateData.episode = null;
+        updateData.currentEpisodeUrl = null;
+        updateData.seriesUrls = null;
+      }
+
       await update(roomRef, updateData);
 
       // If offline video selected, update local state & participant record
-      if (activeSourceTab === "offline" && offlineFile) {
-        if (onOfflineFileSelected) {
-          onOfflineFileSelected(offlineFile);
+      if (activeSourceTab === "offline") {
+        const passOffline = offlineFile || undefined;
+        if (passOffline && onOfflineFileSelected) {
+          onOfflineFileSelected(passOffline);
         }
         const participantRef = ref(rtdb, `rooms/${roomCode}/participants/${user.uid}`);
         await update(participantRef, { hasOfflineFile: true }).catch(() => {});
@@ -455,18 +499,18 @@ export function ChangeMediaModal({
 
               <div>
                 <label className="block text-[11px] font-semibold uppercase tracking-wider text-neutral-400 mb-1">
-                  Direct MP4 Video URL *
+                  Direct Video or HLS URL (MP4 / M3U8) *
                 </label>
                 <input
                   type="url"
                   required
                   value={directUrl}
                   onChange={(e) => setDirectUrl(e.target.value)}
-                  placeholder="https://example.com/movie.mp4"
+                  placeholder="https://example.com/movie.mp4 or stream.m3u8"
                   className="w-full px-3 py-2 bg-neutral-950 border border-neutral-700 rounded-xl text-white placeholder-neutral-500 focus:outline-none focus:ring-2 focus:ring-rose-500 text-xs"
                 />
                 <p className="text-[10px] text-neutral-500 mt-1">
-                  Provide an HTTP or HTTPS link to a direct MP4 video stream.
+                  Provide an HTTP or HTTPS link to a direct MP4 video or HLS (.m3u8) adaptive stream.
                 </p>
               </div>
             </div>
@@ -490,7 +534,7 @@ export function ChangeMediaModal({
                 </label>
                 <input
                   type="file"
-                  accept="video/*"
+                  accept="video/*,.mp4,.mkv,.mov,.avi,.webm,.m4v,.flv,.wmv,.3gp,.ts,.m2ts"
                   onChange={(e) => {
                     const file = e.target.files?.[0];
                     if (!file) return;
@@ -499,24 +543,6 @@ export function ChangeMediaModal({
                   }}
                   className="w-full text-xs text-neutral-400 file:mr-3 file:py-1.5 file:px-3 file:rounded-lg file:border-0 file:text-xs file:font-semibold file:bg-neutral-800 file:text-white hover:file:bg-neutral-700 cursor-pointer"
                 />
-              </div>
-
-              <div className="p-3 bg-emerald-500/10 border border-emerald-500/30 rounded-xl text-[11px] flex flex-col gap-1.5 mt-2">
-                <p className="font-semibold text-emerald-400 flex items-center gap-1.5">
-                  <Smartphone className="w-4 h-4 shrink-0 text-emerald-400" />
-                  Using Android?
-                </p>
-                <p className="text-neutral-300 leading-relaxed">
-                  Android Chrome has limited video codec support. For the best playback experience and codec compatibility, we highly recommend downloading and installing our native Android app:
-                </p>
-                <a
-                  href="https://github.com/jinwoo-09/muvidate/releases/download/1.0/Muvidate_1.0.apk"
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  className="text-emerald-400 hover:text-emerald-300 font-semibold underline break-all"
-                >
-                  https://github.com/jinwoo-09/muvidate/releases/download/1.0/Muvidate_1.0.apk
-                </a>
               </div>
 
               {offlineFile && (
